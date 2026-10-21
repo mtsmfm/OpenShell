@@ -292,8 +292,8 @@ The agent uses these endpoints at `http://policy.local`:
 | `GET /v1/proposals/{chunk_id}/wait?timeout=300` | Waits until the proposal is approved or rejected, or until the timeout expires. |
 
 After an approval, the `/wait` response reports `policy_reloaded: true` once the
-sandbox has loaded the new rule. OpenShell closes connections opened under the
-previous rules, so the agent's retry uses the new rule.
+sandbox has loaded the new rule. The agent's retry uses the new rule. Open
+connections that the new rule does not affect stay open.
 
 When the policy advisor is disabled, every route returns `404 feature_disabled`,
 new sandboxes do not receive the guide, and denial responses do not mention

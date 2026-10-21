@@ -188,16 +188,20 @@ running sandbox. The startup sections do not:
 
 | Change | Effect on a running sandbox | Required action |
 |---|---|---|
-| Network rules | The sandbox loads the new rules. Connections opened under the previous rules close. | Apply the change, then retry the request. |
+| Network rules | The sandbox loads the new rules. Open connections that the change affects close. | Apply the change, then retry the request. |
 | Middleware in `network_middlewares` | You can add, remove, or reconfigure built-in middleware and external services already registered with the gateway. | Apply the change with `openshell policy set`. |
 | External middleware registration | Policy changes cannot register a service or change its gateway connection settings. | Update the gateway configuration and restart the gateway. |
 | Added filesystem paths | The saved policy can change, but the running workload keeps its existing filesystem permissions. | Recreate the sandbox. |
 | Removed filesystem paths, or changed `include_workdir`, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
 
-When new network rules take effect, OpenShell closes connections that were
-opened under the previous rules, including HTTP keep-alive connections, tunnels,
-WebSocket connections, and long-lived streams. Clients must reconnect, and their
-next requests are checked against the new rules.
+When new network rules take effect, OpenShell checks each open connection,
+including HTTP keep-alive connections, tunnels, WebSocket connections, and
+long-lived streams, against the new rules. A connection stays open when the new
+rules admit it exactly as before: its binary is still allowed, and its matching
+endpoints, credential rules, and middleware are unchanged. Later requests on it
+are checked against the new rules. OpenShell closes every other connection, and
+every connection when the sandbox blocks traffic after a failed update. Clients
+must reconnect, and their next requests are checked against the new rules.
 
 OpenShell validates every change twice before it takes effect:
 
@@ -207,7 +211,7 @@ flowchart TD
     B -->|Invalid| C["Change rejected<br/>Current policy stays active"]
     B -->|Valid| D["Gateway saves a new revision"]
     D --> E{"Sandbox validates<br/>and loads the revision"}
-    E -->|Loads| F["New rules active<br/>Old connections close"]
+    E -->|Loads| F["New rules active<br/>Affected connections close"]
     E -->|Fails| G["Failure mode applies<br/>Block traffic or keep the last valid policy"]
 ```
 

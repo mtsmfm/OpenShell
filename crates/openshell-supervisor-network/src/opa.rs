@@ -30,7 +30,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{debug, info};
 
 mod raw_schema;
 
@@ -115,6 +115,7 @@ pub struct EgressAuthorization {
 }
 
 /// Input for a network access policy evaluation.
+#[derive(Debug, Clone)]
 pub struct NetworkInput {
     pub host: String,
     pub port: u16,
@@ -180,6 +181,8 @@ pub struct OpaEngine {
     binary_identity_required: bool,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
+    /// Incremented whenever the middleware registry is replaced.
+    middleware_epoch: AtomicU64,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     generation_tx: watch::Sender<u64>,
     fail_closed_reason: RwLock<Option<String>>,
@@ -204,24 +207,37 @@ pub(crate) fn test_opa_query_count() -> u64 {
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
+///
+/// Clones share the captured generation, so a relay readmitted to a newer
+/// generation through one clone is current through all of them.
 #[derive(Clone, Debug)]
 pub struct PolicyGenerationGuard {
-    captured_generation: u64,
+    captured_generation: Arc<AtomicU64>,
     current_generation: Arc<AtomicU64>,
     generation_rx: watch::Receiver<u64>,
+    readmission: Option<Arc<RelayReadmission>>,
 }
 
 impl PolicyGenerationGuard {
     pub fn captured_generation(&self) -> u64 {
-        self.captured_generation
+        self.captured_generation.load(Ordering::Acquire)
     }
 
     pub fn current_generation(&self) -> u64 {
         self.current_generation.load(Ordering::Acquire)
     }
 
+    /// Whether the captured generation no longer applies.
+    ///
+    /// A guard pinned for an established relay first tries to readmit the
+    /// relay to the current generation; see [`OpaEngine::relay_generation_guard`].
     pub fn is_stale(&self) -> bool {
-        self.current_generation() != self.captured_generation
+        if self.current_generation() == self.captured_generation() {
+            return false;
+        }
+        self.readmission
+            .as_ref()
+            .is_none_or(|readmission| !readmission.readmit(&self.captured_generation))
     }
 
     pub fn ensure_current(&self) -> Result<()> {
@@ -249,10 +265,90 @@ impl PolicyGenerationGuard {
     }
 }
 
+/// Connection-level policy result for one relay identity.
+///
+/// A reload leaves a relay usable only when every part of this result is
+/// unchanged: the L4 action, the matched endpoints and their configuration
+/// (TLS, L7 protocol and rules, allowed IPs, credentials), credential guards,
+/// and the middleware configuration and registry.
+#[derive(Debug, PartialEq)]
+struct RelayAdmission {
+    authorization: regorus::Value,
+    credential_guards: regorus::Value,
+    middlewares: regorus::Value,
+    middleware_epoch: u64,
+}
+
+/// State that lets an established relay follow a policy reload that does not
+/// change its admission.
+struct RelayReadmission {
+    policy: Arc<OpaEngine>,
+    input: NetworkInput,
+    admission: RelayAdmission,
+    /// Per-tunnel evaluator replaced with the readmitting generation's engine.
+    tunnel_engine: Option<Arc<Mutex<regorus::Engine>>>,
+    /// Set once readmission fails; a revoked relay never becomes current again.
+    revoked: Mutex<bool>,
+}
+
+impl std::fmt::Debug for RelayReadmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayReadmission")
+            .field("host", &self.input.host)
+            .field("port", &self.input.port)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RelayReadmission {
+    fn readmit(&self, captured_generation: &AtomicU64) -> bool {
+        // Serialize readmission so the evaluator and the captured generation
+        // always move together.
+        let Ok(mut revoked) = self.revoked.lock() else {
+            return false;
+        };
+        if *revoked {
+            return false;
+        }
+        let captured = captured_generation.load(Ordering::Acquire);
+        let readmitted = self
+            .policy
+            .readmit_relay(
+                &self.input,
+                &self.admission,
+                captured,
+                self.tunnel_engine.is_some(),
+            )
+            .unwrap_or_default();
+        let Some((generation, engine)) = readmitted else {
+            *revoked = true;
+            return false;
+        };
+        if let (Some(slot), Some(engine)) = (&self.tunnel_engine, engine) {
+            let Ok(mut slot) = slot.lock() else {
+                *revoked = true;
+                return false;
+            };
+            *slot = engine;
+        }
+        captured_generation.store(generation, Ordering::Release);
+        if generation != captured {
+            debug!(
+                host = %self.input.host,
+                port = self.input.port,
+                previous_generation = captured,
+                generation,
+                "Relay readmitted after policy reload"
+            );
+        }
+        true
+    }
+}
+
 /// Per-tunnel L7 policy evaluator bound to the engine generation captured when
 /// the tunnel was established.
 pub struct TunnelPolicyEngine {
-    engine: Mutex<regorus::Engine>,
+    engine: Arc<Mutex<regorus::Engine>>,
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
@@ -314,6 +410,7 @@ impl OpaEngine {
             binary_identity_required,
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
+            middleware_epoch: AtomicU64::new(0),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
@@ -810,6 +907,7 @@ impl OpaEngine {
         *engine = new_engine;
         if let Some(new_runner) = new_runner {
             *runner = new_runner;
+            self.middleware_epoch.fetch_add(1, Ordering::AcqRel);
         }
         *fail_closed_reason = None;
         self.generation_guard(generation)
@@ -904,6 +1002,7 @@ impl OpaEngine {
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
         *runner = runner.with_replacement_registry(registry);
+        self.middleware_epoch.fetch_add(1, Ordering::AcqRel);
         self.advance_generation();
         Ok(())
     }
@@ -934,11 +1033,155 @@ impl OpaEngine {
                 "policy changed before HTTP relay started [expected_generation:{expected_generation} current_generation:{generation}]"
             ));
         }
-        Ok(PolicyGenerationGuard {
-            captured_generation: generation,
+        Ok(self.guard_for(generation, None))
+    }
+
+    fn guard_for(
+        &self,
+        generation: u64,
+        readmission: Option<RelayReadmission>,
+    ) -> PolicyGenerationGuard {
+        PolicyGenerationGuard {
+            captured_generation: Arc::new(AtomicU64::new(generation)),
             current_generation: Arc::clone(&self.generation),
             generation_rx: self.generation_tx.subscribe(),
+            readmission: readmission.map(Arc::new),
+        }
+    }
+
+    /// Return a guard for an established relay admitted by `input` in
+    /// `expected_generation`.
+    ///
+    /// Unlike [`Self::generation_guard`], the guard does not become stale when
+    /// a later generation admits the same relay identically (see
+    /// [`RelayAdmission`]): the relay moves to that generation and keeps its
+    /// connection. Any change to its admission, and fail-closed quarantine,
+    /// still makes the guard stale so the relay closes.
+    pub fn relay_generation_guard(
+        self: &Arc<Self>,
+        expected_generation: u64,
+        input: NetworkInput,
+    ) -> Result<PolicyGenerationGuard> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
+        if generation != expected_generation {
+            return Err(miette::miette!(
+                "policy changed before relay started [expected_generation:{expected_generation} current_generation:{generation}]"
+            ));
+        }
+        let readmission = self.relay_readmission_locked(&mut engine, input, None)?;
+        Ok(self.guard_for(generation, readmission))
+    }
+
+    /// Clone an L7 evaluator for an established relay admitted by `input`.
+    ///
+    /// The evaluator follows readmission like
+    /// [`Self::relay_generation_guard`]; once readmitted, later requests are
+    /// evaluated against the new generation.
+    pub fn clone_engine_for_relay(
+        self: &Arc<Self>,
+        expected_generation: u64,
+        input: NetworkInput,
+    ) -> Result<TunnelPolicyEngine> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
+        if generation != expected_generation {
+            return Err(miette::miette!(
+                "policy changed before L7 tunnel started [expected_generation:{expected_generation} current_generation:{generation}]"
+            ));
+        }
+        let tunnel_engine = Arc::new(Mutex::new(engine.clone()));
+        let readmission =
+            self.relay_readmission_locked(&mut engine, input, Some(Arc::clone(&tunnel_engine)))?;
+        Ok(TunnelPolicyEngine {
+            engine: tunnel_engine,
+            generation_guard: self.guard_for(generation, readmission),
+            middleware_runner: self.middleware_runner()?,
+            websocket_assembly_budget: self.websocket_assembly_budget(),
         })
+    }
+
+    fn relay_readmission_locked(
+        self: &Arc<Self>,
+        engine: &mut regorus::Engine,
+        input: NetworkInput,
+        tunnel_engine: Option<Arc<Mutex<regorus::Engine>>>,
+    ) -> Result<Option<RelayReadmission>> {
+        Ok(self
+            .relay_admission_locked(engine, &input)?
+            .map(|admission| RelayReadmission {
+                policy: Arc::clone(self),
+                input,
+                admission,
+                tunnel_engine,
+                revoked: Mutex::new(false),
+            }))
+    }
+
+    /// Evaluate the connection-level admission of a relay. Returns `None`
+    /// when the relay is not allowed, including during fail-closed quarantine.
+    fn relay_admission_locked(
+        &self,
+        engine: &mut regorus::Engine,
+        input: &NetworkInput,
+    ) -> Result<Option<RelayAdmission>> {
+        if self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        set_regorus_input(engine, network_input_json(input))?;
+        let authorization = engine
+            .eval_rule("data.openshell.sandbox.egress_authorization".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        if get_str(&authorization, "action").as_deref() != Some("allow") {
+            return Ok(None);
+        }
+        let credential_guards = engine
+            .eval_rule("data.openshell.sandbox.endpoint_credential_guards".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        let middlewares = engine
+            .eval_rule("data.openshell.sandbox.network_middlewares".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        Ok(Some(RelayAdmission {
+            authorization,
+            credential_guards,
+            middlewares,
+            middleware_epoch: self.middleware_epoch.load(Ordering::Acquire),
+        }))
+    }
+
+    /// Move a relay from `captured_generation` to the current generation when
+    /// the current policy admits it exactly as `admission` did. Returns the
+    /// generation and, if requested, a tunnel evaluator cloned from it.
+    fn readmit_relay(
+        &self,
+        input: &NetworkInput,
+        admission: &RelayAdmission,
+        captured_generation: u64,
+        clone_engine: bool,
+    ) -> Result<Option<(u64, Option<regorus::Engine>)>> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
+        if generation == captured_generation {
+            return Ok(Some((generation, None)));
+        }
+        if self.relay_admission_locked(&mut engine, input)?.as_ref() != Some(admission) {
+            return Ok(None);
+        }
+        Ok(Some((generation, clone_engine.then(|| engine.clone()))))
     }
 
     /// Query static sandbox configuration from the OPA data module.
@@ -1129,12 +1372,8 @@ impl OpaEngine {
             ));
         }
         Ok(TunnelPolicyEngine {
-            engine: Mutex::new(engine.clone()),
-            generation_guard: PolicyGenerationGuard {
-                captured_generation: generation,
-                current_generation: Arc::clone(&self.generation),
-                generation_rx: self.generation_tx.subscribe(),
-            },
+            engine: Arc::new(Mutex::new(engine.clone())),
+            generation_guard: self.guard_for(generation, None),
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
         })

@@ -5,7 +5,9 @@
 
 use super::{EgressDecision, L7RouteSnapshot, emit_l7_tunnel_close_after_policy_change};
 use crate::l7::relay::L7EvalContext;
-use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::opa::{
+    NetworkAction, NetworkInput, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine,
+};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
 use openshell_core::endpoint_status::EndpointObservationSender;
@@ -120,6 +122,21 @@ pub(super) fn pin_l7_evaluator(
     opa_engine.clone_engine_for_tunnel(expected_generation)
 }
 
+/// Reconstruct the policy input that authorized `decision`.
+///
+/// Process identity was verified when the connection was admitted, so a
+/// relay is re-evaluated with that identity rather than a fresh lookup.
+fn relay_policy_input(decision: &EgressDecision) -> NetworkInput {
+    NetworkInput {
+        host: decision.intent.destination.host.clone(),
+        port: decision.intent.destination.port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    }
+}
+
 pub(super) fn validate_route_generation(
     route: Option<&L7RouteSnapshot>,
     expected_generation: u64,
@@ -142,9 +159,13 @@ pub(super) fn validate_route_generation(
 /// A stale generation preserves the established CONNECT behavior: emit the
 /// policy-change close event and let the adapter close the live tunnel without
 /// attempting to write an HTTP response into it.
+///
+/// Once started, the relay survives a policy reload that admits its
+/// connection identically and closes otherwise; L7 requests after the reload
+/// are evaluated against the new policy.
 pub(super) fn prepare_http_relay<'a>(
     route: Option<&L7RouteSnapshot>,
-    opa_engine: &'a OpaEngine,
+    opa_engine: &'a Arc<OpaEngine>,
     decision: &EgressDecision,
     request: &'a L7EvalContext,
 ) -> Option<RelayContext<'a>> {
@@ -158,7 +179,9 @@ pub(super) fn prepare_http_relay<'a>(
     }
 
     let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
-        let evaluator = match pin_l7_evaluator(opa_engine, decision.policy_generation) {
+        let evaluator = match opa_engine
+            .clone_engine_for_relay(decision.policy_generation, relay_policy_input(decision))
+        {
             Ok(evaluator) => evaluator,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
@@ -179,7 +202,9 @@ pub(super) fn prepare_http_relay<'a>(
             evaluator: Box::new(evaluator),
         }
     } else {
-        let generation_guard = match pin_policy_generation(opa_engine, decision.policy_generation) {
+        let generation_guard = match opa_engine
+            .relay_generation_guard(decision.policy_generation, relay_policy_input(decision))
+        {
             Ok(guard) => guard,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
@@ -200,12 +225,12 @@ pub(super) fn prepare_http_relay<'a>(
     })
 }
 
-/// Pin the generation used by a raw relay so policy activation or quarantine
-/// closes streams that otherwise have no request boundary at which to notice
-/// a stale decision.
+/// Pin the generation used by a raw relay so quarantine, or a policy change
+/// that no longer admits the connection identically, closes streams that
+/// otherwise have no request boundary at which to notice a stale decision.
 pub(super) fn prepare_raw_relay(
     route: Option<&L7RouteSnapshot>,
-    opa_engine: &OpaEngine,
+    opa_engine: &Arc<OpaEngine>,
     decision: &EgressDecision,
 ) -> Option<PolicyGenerationGuard> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
@@ -217,7 +242,9 @@ pub(super) fn prepare_raw_relay(
         return None;
     }
 
-    match pin_policy_generation(opa_engine, decision.policy_generation) {
+    match opa_engine
+        .relay_generation_guard(decision.policy_generation, relay_policy_input(decision))
+    {
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(
@@ -469,7 +496,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut upstream, mut server) = tokio::io::duplex(1024);
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
         let decision = decision(engine.current_generation());
         let request = request_context();
         let context = prepare_http_relay(None, &engine, &decision, &request).unwrap();
@@ -557,7 +584,7 @@ mod tests {
 
     #[test]
     fn relay_without_route_pins_l4_decision_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
         let decision = decision(engine.current_generation());
         let request = request_context();
 
@@ -575,7 +602,7 @@ mod tests {
 
     #[test]
     fn empty_hydrated_route_cannot_replace_stale_l4_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
             configs: vec![],
@@ -591,7 +618,7 @@ mod tests {
 
     #[test]
     fn inspected_route_cannot_replace_stale_l4_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
             configs: vec![super::super::L7ConfigSnapshot {
@@ -629,7 +656,7 @@ mod tests {
 
     #[test]
     fn raw_route_cannot_replace_stale_l4_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
             configs: vec![],
@@ -644,7 +671,7 @@ mod tests {
 
     #[test]
     fn stale_generation_fails_before_relay_context_is_created() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
         let decision = decision(engine.current_generation());
         let request = request_context();
         engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
@@ -653,6 +680,250 @@ mod tests {
             prepare_http_relay(None, &engine, &decision, &request).is_none(),
             "policy reload must prevent a stale relay from starting"
         );
+    }
+
+    const STREAM_ENDPOINT: &str = "
+network_policies:
+  stream:
+    name: stream
+    endpoints:
+      - { host: example.com, port: 80 }
+    binaries:
+      - { path: /usr/bin/curl }
+";
+    const STREAM_REST_ENDPOINT: &str = "
+network_policies:
+  stream:
+    name: stream
+    endpoints:
+      - host: example.com
+        port: 80
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /**
+    binaries:
+      - { path: /usr/bin/curl }
+";
+    const UNRELATED_POLICY: &str = "
+  other:
+    name: other
+    endpoints:
+      - { host: other.example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+";
+    const OTHER_POLICY_ONLY: &str = "
+network_policies:
+  other:
+    name: other
+    endpoints:
+      - { host: other.example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+";
+
+    fn authorized_decision(engine: &OpaEngine) -> EgressDecision {
+        let input = NetworkInput {
+            host: "example.com".to_string(),
+            port: 80,
+            binary_path: "/usr/bin/curl".into(),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let authorization = engine.authorize_egress(&input).unwrap();
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        let mut decision = EgressDecision {
+            intent: EgressIntent::connect("example.com".to_string(), 80),
+            action: authorization.action.clone(),
+            policy_generation: authorization.generation,
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::from_authorization(&authorization),
+            binary: Some(input.binary_path),
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        super::super::hydrate_l7_route(&mut decision);
+        decision
+    }
+
+    async fn read_request_head(server: &mut tokio::io::DuplexStream) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(server.read_u8().await.ok()?);
+        }
+        Some(request)
+    }
+
+    /// Stream a chunked response through an established relay while the
+    /// policy reloads to `reloaded`. Returns the bytes the client received
+    /// after the reload, and whether a second request on the same
+    /// connection was answered.
+    async fn stream_across_reload(initial: &str, reloaded: &str) -> (Vec<u8>, bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, initial).unwrap());
+        let decision = authorized_decision(&engine);
+        let mut request = http_context(
+            &decision,
+            None,
+            None,
+            None,
+            openshell_core::proposals::AgentProposals::default(),
+            RelaySignals {
+                activity: None,
+                endpoint_observation: None,
+            },
+        );
+        request.request_default_port = Some(80);
+        let (mut caller, mut client) = tokio::io::duplex(4096);
+        let (mut upstream, mut server) = tokio::io::duplex(4096);
+        let context = prepare_http_relay(
+            decision.endpoint.l7_route.as_ref(),
+            &engine,
+            &decision,
+            &request,
+        )
+        .expect("current generation should prepare a relay");
+        // Own both sides so a closed relay is visible to its peers as EOF.
+        let relay =
+            Box::pin(async move { relay_http_stream(&mut client, &mut upstream, context).await });
+
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let first = b"5\r\nhello\r\n";
+        let rest = b"5\r\nworld\r\n0\r\n\r\n";
+        let second = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (reloaded_tx, reloaded_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve = async {
+            if read_request_head(&mut server).await.is_none() {
+                return;
+            }
+            server.write_all(head).await.unwrap();
+            server.write_all(first).await.unwrap();
+            server.flush().await.unwrap();
+            let _ = reloaded_rx.await;
+            let _ = server.write_all(rest).await;
+            let _ = server.flush().await;
+            if read_request_head(&mut server).await.is_some() {
+                let _ = server.write_all(second).await;
+                let _ = server.flush().await;
+            }
+        };
+        let receive = async {
+            let request = b"GET /stream HTTP/1.1\r\nHost: example.com\r\n\r\n";
+            caller.write_all(request).await.unwrap();
+            let mut received = vec![0; head.len() + first.len()];
+            caller.read_exact(&mut received).await.unwrap();
+            engine.reload(POLICY_REGO, reloaded).unwrap();
+            // Let the relay observe the new generation before more bytes arrive.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            reloaded_tx.send(()).unwrap();
+            let mut after = vec![0; rest.len()];
+            let mut read = 0;
+            while read < after.len() {
+                match caller.read(&mut after[read..]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => read += n,
+                }
+            }
+            after.truncate(read);
+            let mut response = vec![0; second.len()];
+            let answered = read == rest.len()
+                && caller.write_all(request).await.is_ok()
+                && caller.read_exact(&mut response).await.is_ok()
+                && response == second;
+            drop(caller);
+            (after, answered)
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Box::pin(async {
+                let (_, (), received) = tokio::join!(relay, serve, receive);
+                received
+            }),
+        )
+        .await
+        .expect("relay must not hang across a policy reload")
+    }
+
+    #[tokio::test]
+    async fn passthrough_stream_survives_unrelated_policy_reload() {
+        let reloaded = format!("{STREAM_ENDPOINT}{UNRELATED_POLICY}");
+        let (after, answered) = Box::pin(stream_across_reload(STREAM_ENDPOINT, &reloaded)).await;
+        assert_eq!(after, b"5\r\nworld\r\n0\r\n\r\n");
+        assert!(
+            answered,
+            "keep-alive connection must serve the next request"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspected_stream_survives_unrelated_policy_reload() {
+        let reloaded = format!("{STREAM_REST_ENDPOINT}{UNRELATED_POLICY}");
+        let (after, answered) =
+            Box::pin(stream_across_reload(STREAM_REST_ENDPOINT, &reloaded)).await;
+        assert_eq!(after, b"5\r\nworld\r\n0\r\n\r\n");
+        assert!(
+            answered,
+            "keep-alive connection must serve the next request"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_closes_when_reload_removes_its_endpoint() {
+        for initial in [STREAM_ENDPOINT, STREAM_REST_ENDPOINT] {
+            let (after, answered) =
+                Box::pin(stream_across_reload(initial, OTHER_POLICY_ONLY)).await;
+            assert!(
+                after.is_empty(),
+                "revoked stream must not deliver more bytes"
+            );
+            assert!(!answered);
+        }
+    }
+
+    #[test]
+    fn relay_guard_follows_reloads_until_admission_changes() {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, STREAM_ENDPOINT).unwrap());
+        let decision = authorized_decision(&engine);
+        let guard = prepare_raw_relay(None, &engine, &decision).unwrap();
+        let observer = guard.clone();
+
+        let unrelated = format!("{STREAM_ENDPOINT}{UNRELATED_POLICY}");
+        engine.reload(POLICY_REGO, &unrelated).unwrap();
+        assert!(!guard.is_stale(), "identical admission keeps the relay");
+        assert_eq!(observer.captured_generation(), engine.current_generation());
+
+        let other_binary = STREAM_ENDPOINT.replace("/usr/bin/curl", "/usr/bin/wget");
+        engine.reload(POLICY_REGO, &other_binary).unwrap();
+        assert!(
+            guard.is_stale(),
+            "a binary that is no longer allowed closes"
+        );
+
+        engine.reload(POLICY_REGO, STREAM_ENDPOINT).unwrap();
+        assert!(observer.is_stale(), "a revoked relay never becomes current");
+    }
+
+    #[test]
+    fn relay_guard_closes_on_endpoint_change_and_quarantine() {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, STREAM_ENDPOINT).unwrap());
+        let decision = authorized_decision(&engine);
+        let guard = prepare_raw_relay(None, &engine, &decision).unwrap();
+        engine.reload(POLICY_REGO, STREAM_REST_ENDPOINT).unwrap();
+        assert!(guard.is_stale(), "a changed endpoint configuration closes");
+
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, STREAM_ENDPOINT).unwrap());
+        let decision = authorized_decision(&engine);
+        let guard = prepare_raw_relay(None, &engine, &decision).unwrap();
+        engine.enter_fail_closed("invalid candidate").unwrap();
+        assert!(guard.is_stale(), "fail-closed quarantine closes");
     }
 
     #[tokio::test]

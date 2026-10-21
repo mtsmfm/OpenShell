@@ -3591,7 +3591,11 @@ where
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
             let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
-            if generation != generation_guard.captured_generation() {
+            // A reload since the last check may readmit this relay to `generation`.
+            if generation != generation_guard.captured_generation()
+                && (generation_guard.is_stale()
+                    || generation != generation_guard.captured_generation())
+            {
                 return Ok(());
             }
             let runner = engine.middleware_runner()?;

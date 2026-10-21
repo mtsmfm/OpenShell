@@ -443,8 +443,8 @@ Set `allow_uninspected_credentials: true` to relay binary frames anyway. Set
 `websocket_credential_rewrite: true` only when client text messages contain
 OpenShell credential placeholders that must be resolved.
 
-When new network rules take effect, OpenShell closes open WebSocket connections,
-so the client must reconnect. The client might receive close code `1012`, or the
+When new network rules change the rules that admit an open WebSocket
+connection, OpenShell closes it, so the client must reconnect. The client might receive close code `1012`, or the
 connection might close without a close frame.
 
 ### Allow GraphQL Operations
