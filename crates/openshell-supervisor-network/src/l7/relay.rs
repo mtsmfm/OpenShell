@@ -144,7 +144,7 @@ fn scoped_context_for_request(
     Some(scoped)
 }
 
-fn credential_generation_guard(
+pub(crate) fn credential_generation_guard(
     ctx: &L7EvalContext,
 ) -> Option<crate::l7::rest::CredentialGenerationGuard<'_>> {
     Some(
@@ -236,7 +236,7 @@ pub(crate) async fn prepare_inspected_request(
     Ok((req, scoped))
 }
 
-fn request_authority_matches_endpoint(
+pub(crate) fn request_authority_matches_endpoint(
     request: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
 ) -> bool {
@@ -1636,7 +1636,7 @@ where
     }
 }
 
-fn select_l7_config_for_path<'a>(
+pub(crate) fn select_l7_config_for_path<'a>(
     configs: &'a [L7EndpointConfig],
     path: &str,
 ) -> Option<&'a L7EndpointConfig> {
@@ -1646,7 +1646,7 @@ fn select_l7_config_for_path<'a>(
         .max_by_key(|config| config.path_specificity())
 }
 
-fn emit_l7_request_log(
+pub(crate) fn emit_l7_request_log(
     ctx: &L7EvalContext,
     action: &str,
     redacted_target: &str,

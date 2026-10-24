@@ -310,6 +310,16 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     }))
 }
 
+/// Parse a request head synthesized from an HTTP/2 stream with the same
+/// validation and target canonicalization as an HTTP/1 request.
+pub(crate) async fn parse_synthesized_request_head(
+    head: &[u8],
+    canonicalize_options: &crate::l7::path::CanonicalizeOptions,
+) -> Result<Option<L7Request>> {
+    let mut reader = head;
+    parse_http_request(&mut reader, canonicalize_options).await
+}
+
 /// Build an L7 request from a request already buffered by another proxy path.
 ///
 /// The forward proxy needs this after it has consumed the incoming HTTP/1

@@ -10,6 +10,7 @@
 
 pub mod graphql;
 pub(crate) mod http;
+pub(crate) mod http2;
 pub mod jsonrpc;
 pub(crate) mod mcp;
 pub(crate) mod middleware;

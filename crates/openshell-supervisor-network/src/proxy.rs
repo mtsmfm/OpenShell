@@ -3086,18 +3086,26 @@ async fn handle_mediated_connection(
             // Complete the client handshake before observing the upstream
             // connection. A malformed client handshake provides no evidence
             // of an endpoint network failure.
-            let mut tls_client =
-                match crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await {
+            let offer_h2 = relay::offer_h2(l7_route, &ctx);
+            let (mut tls_client, client_h2) =
+                match crate::l7::tls::tls_terminate_client_alpn(client, tls, &host_lc, offer_h2)
+                    .await
+                {
                     Ok(client) => client,
                     Err(error) => {
                         debug!(host = %host_lc, port, "client TLS handshake failed");
                         return Err(error);
                     }
                 };
-            let mut tls_upstream = match crate::l7::tls::tls_connect_upstream(
+            let upstream_config = if client_h2 {
+                tls.upstream_config_h2()
+            } else {
+                tls.upstream_config()
+            };
+            let (mut tls_upstream, upstream_h2) = match crate::l7::tls::tls_connect_upstream_alpn(
                 upstream,
                 &host_lc,
-                tls.upstream_config(),
+                upstream_config,
             )
             .await
             {
@@ -3124,6 +3132,14 @@ async fn handle_mediated_connection(
                     return Ok(());
                 };
 
+                if client_h2 {
+                    return relay::relay_h2_stream(
+                        &mut tls_client,
+                        upstream_h2.then_some(&mut tls_upstream),
+                        relay_context,
+                    )
+                    .await;
+                }
                 relay::relay_http_stream(&mut tls_client, &mut tls_upstream, relay_context).await
             };
             if let Err(e) = Box::pin(tls_result).await {

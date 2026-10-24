@@ -295,6 +295,53 @@ where
     }
 }
 
+/// Whether to offer `h2` to the sandbox client: every endpoint on the route
+/// is inspected REST that the HTTP/2 relay can enforce, and the tunnel can
+/// carry credentials.
+pub(super) fn offer_h2(route: Option<&L7RouteSnapshot>, request: &L7EvalContext) -> bool {
+    route.is_some_and(|route| {
+        !route.configs.is_empty()
+            && route
+                .configs
+                .iter()
+                .all(|snapshot| crate::l7::http2::endpoint_supports_h2(&snapshot.config))
+    }) && (request.provider_credentials.is_some() || request.secret_resolver.is_some())
+}
+
+/// Relay an HTTP/2 connection. `upstream` is `None` when the upstream did not
+/// negotiate `h2`.
+pub(super) async fn relay_h2_stream<C, U>(
+    client: C,
+    upstream: Option<U>,
+    context: RelayContext<'_>,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    match context.policy {
+        PreparedHttpPolicy::Inspect { configs, evaluator } => {
+            let generation_guard = evaluator.generation_guard().clone();
+            tokio::select! {
+                result = crate::l7::http2::relay_h2(
+                    client,
+                    upstream,
+                    &configs,
+                    &evaluator,
+                    context.request,
+                ) => result,
+                () = generation_guard.wait_until_stale() => {
+                    emit_stale_relay_close(context.request, &generation_guard);
+                    Ok(())
+                }
+            }
+        }
+        PreparedHttpPolicy::Passthrough { .. } => {
+            Err(miette::miette!("HTTP/2 requires an inspected L7 route"))
+        }
+    }
+}
+
 // Exercise the production single/multiple-route dispatch from L7 fixtures.
 #[cfg(test)]
 pub async fn relay_inspected_http_stream_for_test<C, U>(

@@ -205,25 +205,43 @@ impl CertCache {
 pub struct ProxyTlsState {
     cert_cache: CertCache,
     upstream_config: Arc<ClientConfig>,
+    upstream_config_h2: Arc<ClientConfig>,
 }
+
+/// ALPN identifier for HTTP/2 over TLS.
+pub const ALPN_H2: &[u8] = b"h2";
 
 impl ProxyTlsState {
     /// Create a new TLS state with the given cert cache and upstream config.
     pub fn new(cert_cache: CertCache, upstream_config: Arc<ClientConfig>) -> Self {
+        let mut h2_config = (*upstream_config).clone();
+        // Keep http/1.1 so an upstream without h2 completes the handshake and
+        // the relay can refuse each stream instead of dropping the connection.
+        h2_config.alpn_protocols = vec![ALPN_H2.to_vec(), b"http/1.1".to_vec()];
         Self {
             cert_cache,
             upstream_config,
+            upstream_config_h2: Arc::new(h2_config),
         }
     }
 
     /// Get or generate a leaf cert for the hostname and return a TLS acceptor.
     fn acceptor_for(&self, hostname: &str) -> Result<TlsAcceptor> {
+        self.acceptor_with_alpn(hostname, false)
+    }
+
+    /// Like [`Self::acceptor_for`], optionally also offering `h2`.
+    fn acceptor_with_alpn(&self, hostname: &str, offer_h2: bool) -> Result<TlsAcceptor> {
         let leaf = self.cert_cache.get_or_generate(hostname)?;
         let mut server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
             .into_diagnostic()?;
-        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        server_config.alpn_protocols = if offer_h2 {
+            vec![ALPN_H2.to_vec(), b"http/1.1".to_vec()]
+        } else {
+            vec![b"http/1.1".to_vec()]
+        };
         Ok(TlsAcceptor::from(Arc::new(server_config)))
     }
 
@@ -231,6 +249,49 @@ impl ProxyTlsState {
     pub fn upstream_config(&self) -> &Arc<ClientConfig> {
         &self.upstream_config
     }
+
+    /// Upstream client config that prefers `h2`, for connections whose
+    /// sandbox side negotiated HTTP/2.
+    pub fn upstream_config_h2(&self) -> &Arc<ClientConfig> {
+        &self.upstream_config_h2
+    }
+}
+
+/// Accept TLS from a sandbox client, optionally offering `h2` in ALPN.
+///
+/// Returns the stream and whether the client selected `h2`.
+pub async fn tls_terminate_client_alpn<S>(
+    client: S,
+    tls_state: &ProxyTlsState,
+    hostname: &str,
+    offer_h2: bool,
+) -> Result<(tokio_rustls::server::TlsStream<S>, bool)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let acceptor = tls_state.acceptor_with_alpn(hostname, offer_h2)?;
+    let tls_stream = acceptor.accept(client).await.into_diagnostic()?;
+    let negotiated_h2 = offer_h2 && tls_stream.get_ref().1.alpn_protocol() == Some(ALPN_H2);
+    Ok((tls_stream, negotiated_h2))
+}
+
+/// Connect TLS upstream and report whether the server selected `h2`.
+pub async fn tls_connect_upstream_alpn<U>(
+    upstream: U,
+    hostname: &str,
+    client_config: &Arc<ClientConfig>,
+) -> Result<(tokio_rustls::client::TlsStream<U>, bool)>
+where
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let connector = TlsConnector::from(Arc::clone(client_config));
+    let server_name = ServerName::try_from(hostname.to_string()).into_diagnostic()?;
+    let tls_stream = connector
+        .connect(server_name, upstream)
+        .await
+        .into_diagnostic()?;
+    let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(ALPN_H2);
+    Ok((tls_stream, negotiated_h2))
 }
 
 /// Accept TLS from a sandbox client, presenting a dynamic cert for the hostname.

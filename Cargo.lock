@@ -5196,6 +5196,7 @@ dependencies = [
  "flate2",
  "futures",
  "glob",
+ "h2",
  "hex",
  "hickory-proto",
  "http 1.4.0",
