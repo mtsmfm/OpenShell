@@ -3086,7 +3086,7 @@ async fn handle_mediated_connection(
             // Complete the client handshake before observing the upstream
             // connection. A malformed client handshake provides no evidence
             // of an endpoint network failure.
-            let offer_h2 = relay::offer_h2(l7_route, &ctx);
+            let offer_h2 = relay::offer_h2(l7_route, &opa_engine, &ctx);
             let (mut tls_client, client_h2) =
                 match crate::l7::tls::tls_terminate_client_alpn(client, tls, &host_lc, offer_h2)
                     .await

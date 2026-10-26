@@ -37,14 +37,49 @@ use tracing::debug;
 const MAX_CONCURRENT_STREAMS: u32 = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 
+/// The `host:port` destinations that opt in to HTTP/2, comma-separated, fixed
+/// when the supervisor is built (`OPENSHELL_HTTP2_ENDPOINTS`). Unset or empty:
+/// every tunnel negotiates HTTP/1.1 only.
+pub const HTTP2_ENDPOINTS: &str = match option_env!("OPENSHELL_HTTP2_ENDPOINTS") {
+    Some(list) => list,
+    None => "",
+};
+
+/// Whether `host:port` is listed in `opted_in` (see [`HTTP2_ENDPOINTS`]).
+pub fn endpoint_opted_in(opted_in: &str, host: &str, port: u16) -> bool {
+    opted_in.split(',').any(|entry| {
+        entry.trim().rsplit_once(':').is_some_and(|(h, p)| {
+            h.eq_ignore_ascii_case(host) && p.parse::<u16>().is_ok_and(|p| p == port)
+        })
+    })
+}
+
 /// Whether an endpoint's enforcement can be applied to HTTP/2 streams.
 ///
 /// Request signing and body rewriting need the whole HTTP/1 body path, so
 /// those endpoints keep negotiating HTTP/1.1.
-pub(crate) fn endpoint_supports_h2(config: &L7EndpointConfig) -> bool {
+pub fn endpoint_supports_h2(config: &L7EndpointConfig) -> bool {
     config.protocol == L7Protocol::Rest
         && !config.credential_signing.is_sigv4()
         && !config.request_body_credential_rewrite
+}
+
+/// Whether to offer `h2` to the sandbox client: the destination opted in,
+/// every endpoint on the route is inspected REST that the relay can enforce,
+/// the tunnel can carry credentials, and no middleware applies (the relay
+/// refuses streams that need middleware).
+pub fn should_offer_h2<'a>(
+    opted_in: &str,
+    ctx: &L7EvalContext,
+    configs: impl IntoIterator<Item = &'a L7EndpointConfig>,
+    middleware_chain_is_empty: impl FnOnce() -> bool,
+) -> bool {
+    let mut configs = configs.into_iter().peekable();
+    endpoint_opted_in(opted_in, &ctx.host, ctx.port)
+        && configs.peek().is_some()
+        && configs.all(endpoint_supports_h2)
+        && (ctx.provider_credentials.is_some() || ctx.secret_resolver.is_some())
+        && middleware_chain_is_empty()
 }
 
 struct Shared<'a> {
@@ -55,7 +90,7 @@ struct Shared<'a> {
 
 /// Relay one HTTP/2 connection. `upstream` is `None` when the upstream did
 /// not negotiate `h2`; every stream is then answered with 502.
-pub(crate) async fn relay_h2<C, U>(
+pub async fn relay_h2<C, U>(
     client: C,
     upstream: Option<U>,
     configs: &[L7EndpointConfig],
@@ -232,6 +267,20 @@ async fn admit(parts: &http::request::Parts, shared: &Shared<'_>) -> Result<Admi
             StatusCode::FORBIDDEN,
             "unsupported_request",
             "extended CONNECT is not supported over HTTP/2",
+        ));
+    }
+    // Only origin-form: other forms would be evaluated on the path they name
+    // but forwarded as `:path` appended to the authority. The path
+    // canonicalizer rejects asterisk-form too.
+    if !parts
+        .uri
+        .path_and_query()
+        .is_some_and(|target| target.as_str().starts_with('/'))
+    {
+        return Err(Refusal::json(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            ":path must be origin-form",
         ));
     }
     let head = synthesize_h1_head(parts)
@@ -650,10 +699,18 @@ network_policies:
         /// Placeholders handed to the "sandbox": token and modal secret.
         token: String,
         secret: String,
+        /// The build-time opt-in list (`HTTP2_ENDPOINTS`) for this proxy.
+        opted_in: &'static str,
     }
 
+    const OPTED_IN: &str = "other.example.test:443, API.example.test:443";
+
     async fn fixture(upstream_h2: bool) -> Fixture {
-        let engine = OpaEngine::from_strings(TEST_POLICY, POLICY_DATA).unwrap();
+        fixture_with(upstream_h2, POLICY_DATA, OPTED_IN).await
+    }
+
+    async fn fixture_with(upstream_h2: bool, policy_data: &str, opted_in: &'static str) -> Fixture {
+        let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
         let input = NetworkInput {
             host: HOST.into(),
             port: 443,
@@ -711,6 +768,7 @@ network_policies:
             seen,
             token: child_env["TOKEN"].clone(),
             secret: child_env["MODAL_SECRET"].clone(),
+            opted_in,
         }
     }
 
@@ -865,9 +923,14 @@ network_policies:
             Arc::clone(&f.proxy_tls),
             f.upstream_addr,
         );
+        let offer_h2 = should_offer_h2(f.opted_in, &ctx, &configs, || {
+            engine
+                .query_middleware_chain(&crate::l7::middleware::middleware_network_input(&ctx))
+                .is_ok_and(|chain| chain.is_empty())
+        });
         tokio::spawn(async move {
             let (mut tls_client, client_h2) =
-                tls_terminate_client_alpn(client_io, &tls, HOST, true).await?;
+                tls_terminate_client_alpn(client_io, &tls, HOST, offer_h2).await?;
             let config = if client_h2 {
                 tls.upstream_config_h2()
             } else {
@@ -1098,6 +1161,68 @@ network_policies:
         assert_eq!(seen.path, "/v1/h1");
         assert_eq!(seen.header("authorization"), Some("Bearer real-token"));
         assert!(!seen.carries_marker());
+    }
+
+    async fn negotiated_alpn(f: &Fixture) -> Option<Vec<u8>> {
+        let (stream, _proxy) = sandbox_tls(f, &[b"h2", b"http/1.1"]).await;
+        stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
+    }
+
+    #[tokio::test]
+    async fn endpoint_without_opt_in_offers_only_http1() {
+        for opted_in in ["", "other.example.test:443", "api.example.test:8443"] {
+            let f = fixture_with(true, POLICY_DATA, opted_in).await;
+            assert!(f.ctx.secret_resolver.is_some());
+            assert_eq!(
+                negotiated_alpn(&f).await.as_deref(),
+                Some(&b"http/1.1"[..]),
+                "{opted_in:?}"
+            );
+        }
+        let f = fixture(true).await;
+        assert_eq!(negotiated_alpn(&f).await.as_deref(), Some(&b"h2"[..]));
+    }
+
+    #[tokio::test]
+    async fn route_with_middleware_never_offers_h2() {
+        let data = format!(
+            r#"
+network_middlewares:
+  request-middleware:
+    middleware: openshell/regex
+    on_error: fail_closed
+    endpoints:
+      include: ["{HOST}"]
+{}"#,
+            POLICY_DATA.trim_start_matches('\n')
+        );
+        let f = fixture_with(true, &data, OPTED_IN).await;
+        assert_eq!(negotiated_alpn(&f).await.as_deref(), Some(&b"http/1.1"[..]));
+    }
+
+    #[tokio::test]
+    async fn non_origin_form_path_is_refused_for_that_stream() {
+        let mut f = fixture(true).await;
+        let (sender, _proxy) = h2_client(&f).await;
+        let uri = http::Uri::from_parts({
+            let mut parts = http::uri::Parts::default();
+            parts.scheme = Some(http::uri::Scheme::HTTPS);
+            parts.authority = Some(HOST.parse().unwrap());
+            parts.path_and_query = Some(http::uri::PathAndQuery::from_static(
+                "https://api.example.test/v1/x",
+            ));
+            parts
+        })
+        .unwrap();
+        let request = Request::builder().method("GET").uri(uri).body(()).unwrap();
+        let (status, _, _) = exchange(&sender, request, None).await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_upstream_quiet(&mut f).await;
+        let (status, _, _) = exchange(&sender, get("/v1/after", &[]), None)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(next_seen(&mut f).await.path, "/v1/after");
     }
 
     #[tokio::test]

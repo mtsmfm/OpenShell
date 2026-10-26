@@ -109,7 +109,7 @@ ClientRecv ==
                  up, utag, uReqDone, uHead, u2p, upAlive, goaway, upLog>>
 
 -----------------------------------------------------------------------------
-(* Proxy: connection task.  relay_h2 accept loop, http2.rs:105-130 *)
+(* Proxy: connection task.  relay_h2 accept loop, http2.rs:140-165 *)
 
 ProxyDemux ==
   /\ c2p # <<>>
@@ -119,7 +119,7 @@ ProxyDemux ==
   /\ UNCHANGED <<cl, req, px, decision, pReqDone, hdrOf, umap, uidOf, nextUid, p2u, up,
                  utag, uReqDone, uHead, u2p, p2c, upAlive, goaway, upLog, cLog>>
 
-\* server.accept() yields (request, respond); streams.push(handle_stream) http2.rs:109-111
+\* server.accept() yields (request, respond); streams.push(handle_stream) http2.rs:144-146
 Accept(s) ==
   /\ px[s] = "none" /\ inbuf[s] # <<>> /\ Head(inbuf[s]).t = "H"
   /\ hdrOf' = [hdrOf EXCEPT ![s] = Head(inbuf[s]).ph]
@@ -129,9 +129,10 @@ Accept(s) ==
   /\ UNCHANGED <<cl, req, c2p, decision, umap, uidOf, nextUid, p2u, up, utag, uReqDone,
                  uHead, u2p, p2c, upAlive, goaway, upLog, cLog>>
 
-\* admit(): evaluate_l7_request http2.rs:287, deny -> 403 http2.rs:303,
-\* rewrite_http_header_block failure -> credential_refusal http2.rs:345-350,
-\* refusal.send http2.rs:182.  Only this stream's respond handle is touched.
+\* admit(): a non-origin-form :path -> 400 http2.rs:275-286 (a refusal like
+\* deny: allowed = FALSE), evaluate_l7_request http2.rs:336, deny -> 403 http2.rs:352,
+\* rewrite_http_header_block failure -> credential_refusal http2.rs:394-399,
+\* refusal.send http2.rs:217.  Only this stream's respond handle is touched.
 Admit(s) ==
   /\ px[s] = "admitting"
   /\ \/ /\ ~req[s].allowed
@@ -149,7 +150,7 @@ Admit(s) ==
   /\ UNCHANGED <<cl, req, c2p, inbuf, pReqDone, hdrOf, umap, uidOf, nextUid, p2u, up, utag,
                  uReqDone, uHead, u2p, upAlive, goaway, upLog, cLog>>
 
-\* sender.ready() / send_request http2.rs:194-216; no upstream -> 502.
+\* sender.ready() / send_request http2.rs:229-251; no upstream -> 502.
 Forward(s) ==
   /\ px[s] = "ready"
   /\ IF ~upAlive
@@ -165,10 +166,10 @@ Forward(s) ==
   /\ UNCHANGED <<cl, req, c2p, inbuf, decision, pReqDone, hdrOf, up, utag, uReqDone, uHead,
                  u2p, upAlive, goaway, upLog, cLog>>
 
-\* pump(body, upstream_send, true) http2.rs:493-560: DATA forwarded unless it
-\* carries a marker (carries_marker http2.rs:516 -> send_reset); a client RST
-\* surfaces as a recv error and is propagated upstream (http2.rs:508-512), or
-\* via respond.poll_reset in relay_response (http2.rs:472).
+\* pump(body, upstream_send, true) http2.rs:542-609: DATA forwarded unless it
+\* carries a marker (carries_marker http2.rs:565 -> send_reset); a client RST
+\* surfaces as a recv error and is propagated upstream (http2.rs:557-561), or
+\* via respond.poll_reset in relay_response (http2.rs:521).
 PumpReq(s) ==
   /\ px[s] = "fwd" /\ inbuf[s] # <<>>
   /\ LET f == Head(inbuf[s]) IN
@@ -196,7 +197,7 @@ Drop(s) ==
   /\ UNCHANGED <<cl, req, c2p, px, decision, pReqDone, hdrOf, umap, uidOf, nextUid, p2u, up,
                  utag, uReqDone, uHead, u2p, p2c, upAlive, goaway, upLog, cLog>>
 
-\* relay_response / pump(.., false) http2.rs:468-490: frames from upstream
+\* relay_response / pump(.., false) http2.rs:517-539: frames from upstream
 \* stream u go to the client stream whose handler owns u.
 ProxyRecvUp ==
   /\ u2p # <<>>
@@ -215,7 +216,7 @@ ProxyRecvUp ==
                  up, utag, uReqDone, uHead, upAlive, goaway, upLog, cLog>>
 
 \* Upstream connection ended (GOAWAY or close): upstream_conn branch
-\* http2.rs:120-128 -> graceful_shutdown; in-flight streams error -> RST.
+\* http2.rs:155-163 -> graceful_shutdown; in-flight streams error -> RST.
 UpLost(s) ==
   /\ px[s] = "fwd" /\ ~upAlive
   /\ px' = [px EXCEPT ![s] = "reset"]

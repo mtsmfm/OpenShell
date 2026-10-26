@@ -295,17 +295,27 @@ where
     }
 }
 
-/// Whether to offer `h2` to the sandbox client: every endpoint on the route
-/// is inspected REST that the HTTP/2 relay can enforce, and the tunnel can
-/// carry credentials.
-pub(super) fn offer_h2(route: Option<&L7RouteSnapshot>, request: &L7EvalContext) -> bool {
-    route.is_some_and(|route| {
-        !route.configs.is_empty()
-            && route
-                .configs
-                .iter()
-                .all(|snapshot| crate::l7::http2::endpoint_supports_h2(&snapshot.config))
-    }) && (request.provider_credentials.is_some() || request.secret_resolver.is_some())
+/// Whether to offer `h2` to the sandbox client (`l7::http2::should_offer_h2`).
+pub(super) fn offer_h2(
+    route: Option<&L7RouteSnapshot>,
+    opa_engine: &OpaEngine,
+    request: &L7EvalContext,
+) -> bool {
+    let Some(route) = route else {
+        return false;
+    };
+    crate::l7::http2::should_offer_h2(
+        crate::l7::http2::HTTP2_ENDPOINTS,
+        request,
+        route.configs.iter().map(|snapshot| &snapshot.config),
+        || {
+            opa_engine
+                .query_middleware_chain_with_generation(
+                    &crate::l7::middleware::middleware_network_input(request),
+                )
+                .is_ok_and(|(chain, _)| chain.is_empty())
+        },
+    )
 }
 
 /// Relay an HTTP/2 connection. `upstream` is `None` when the upstream did not
