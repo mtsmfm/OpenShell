@@ -63,6 +63,11 @@ pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
 /// stream. The gateway keeps configuration updates below it.
 pub const MAX_SUPERVISOR_STREAM_MESSAGE_BYTES: usize = 9 * 1024 * 1024;
 
+/// Largest unary gateway response the supervisor's client accepts. Draft
+/// policy listings include decided chunks, which the gateway keeps, so they
+/// outgrow tonic's 4 MiB default.
+pub const MAX_GATEWAY_RESPONSE_BYTES: usize = 64 << 20;
+
 /// Shared, refreshable Bearer header. All [`AuthInterceptor`] clones read
 /// the same slot, so the renewal task can replace the token in place without
 /// rebuilding the channel. `None` means the owning sandbox instance revoked it.
@@ -1078,7 +1083,7 @@ mod workspace_tests {
 /// Connect to the `OpenShell` server with one sandbox instance's credentials.
 async fn connect(gateway: &GatewayEndpoint) -> Result<OpenShellClient<AuthedChannel>> {
     let channel = connect_channel(gateway).await?;
-    Ok(OpenShellClient::new(channel))
+    Ok(OpenShellClient::new(channel).max_decoding_message_size(MAX_GATEWAY_RESPONSE_BYTES))
 }
 
 /// Fetch sandbox policy from `OpenShell` server via gRPC.
