@@ -279,6 +279,79 @@ struct RelayAdmission {
     middleware_epoch: u64,
 }
 
+/// Remove the whole-policy hash from an endpoint object.
+///
+/// Every endpoint taken from a proto policy carries `policy_hash`, the hash
+/// of the complete policy, so any edit anywhere in the policy changes it. It
+/// identifies the policy for grant and endpoint reporting, not what the
+/// endpoint admits, and is left out of a relay's admission.
+fn without_policy_hash(endpoint: &regorus::Value) -> regorus::Value {
+    match endpoint {
+        regorus::Value::Object(fields) => {
+            let key = regorus::Value::String("policy_hash".into());
+            regorus::Value::from(
+                fields
+                    .iter()
+                    .filter(|(name, _)| **name != key)
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+        }
+        other => other.clone(),
+    }
+}
+
+fn map_array(
+    value: &regorus::Value,
+    map: impl Fn(&regorus::Value) -> regorus::Value,
+) -> regorus::Value {
+    match value {
+        regorus::Value::Array(items) => {
+            regorus::Value::from(items.iter().map(map).collect::<Vec<_>>())
+        }
+        other => other.clone(),
+    }
+}
+
+fn map_field(
+    value: &regorus::Value,
+    field: &str,
+    map: impl Fn(&regorus::Value) -> regorus::Value,
+) -> regorus::Value {
+    match value {
+        regorus::Value::Object(fields) => {
+            let key = regorus::Value::String(field.into());
+            regorus::Value::from(
+                fields
+                    .iter()
+                    .map(|(name, value)| {
+                        let value = if *name == key {
+                            map(value)
+                        } else {
+                            value.clone()
+                        };
+                        (name.clone(), value)
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+        }
+        other => other.clone(),
+    }
+}
+
+/// `egress_authorization` with `policy_hash` removed from its endpoint
+/// configs and matched endpoint records.
+fn authorization_without_policy_hash(authorization: &regorus::Value) -> regorus::Value {
+    let authorization = map_field(authorization, "endpoint_configs", |configs| {
+        map_array(configs, without_policy_hash)
+    });
+    map_field(&authorization, "matched_endpoints", |records| {
+        map_array(records, |record| {
+            map_field(record, "endpoint", without_policy_hash)
+        })
+    })
+}
+
 /// State that lets an established relay follow a policy reload that does not
 /// change its admission.
 struct RelayReadmission {
@@ -1153,8 +1226,8 @@ impl OpaEngine {
             .eval_rule("data.openshell.sandbox.network_middlewares".into())
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Some(RelayAdmission {
-            authorization,
-            credential_guards,
+            authorization: authorization_without_policy_hash(&authorization),
+            credential_guards: map_array(&credential_guards, without_policy_hash),
             middlewares,
             middleware_epoch: self.middleware_epoch.load(Ordering::Acquire),
         }))

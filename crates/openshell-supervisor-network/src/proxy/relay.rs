@@ -888,6 +888,41 @@ network_policies:
         }
     }
 
+    fn proto_policy(yaml: &str) -> openshell_core::proto::SandboxPolicy {
+        openshell_policy::parse_sandbox_policy(&format!("version: 1\n{yaml}"))
+            .expect("test policy should parse")
+    }
+
+    /// Policies delivered by the gateway arrive as protos, whose endpoints
+    /// carry the hash of the whole policy; an unrelated edit changes it.
+    #[test]
+    fn proto_policy_relays_survive_unrelated_reload() {
+        for initial in [STREAM_ENDPOINT, STREAM_REST_ENDPOINT] {
+            let engine = Arc::new(OpaEngine::from_proto(&proto_policy(initial)).unwrap());
+            let decision = authorized_decision(&engine);
+            let raw = engine
+                .relay_generation_guard(decision.policy_generation, relay_policy_input(&decision))
+                .unwrap();
+            let tunnel = engine
+                .clone_engine_for_relay(decision.policy_generation, relay_policy_input(&decision))
+                .unwrap();
+
+            let unrelated = proto_policy(&format!("{initial}{UNRELATED_POLICY}"));
+            engine.reload_from_proto(&unrelated).unwrap();
+            assert!(!raw.is_stale(), "unrelated edit keeps the raw relay");
+            assert!(!tunnel.is_stale(), "unrelated edit keeps the L7 tunnel");
+
+            engine
+                .reload_from_proto(&proto_policy(OTHER_POLICY_ONLY))
+                .unwrap();
+            assert!(raw.is_stale(), "removing the endpoint closes the raw relay");
+            assert!(
+                tunnel.is_stale(),
+                "removing the endpoint closes the L7 tunnel"
+            );
+        }
+    }
+
     #[test]
     fn relay_guard_follows_reloads_until_admission_changes() {
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, STREAM_ENDPOINT).unwrap());
